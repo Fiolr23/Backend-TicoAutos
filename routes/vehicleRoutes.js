@@ -3,13 +3,17 @@ const router = express.Router();
 
 const {
   vehiclePost,
-  vehicleGet,
   vehiclePut,
   vehicleDelete,
-  vehicleSold
+  vehicleSold,
+  vehicleGet,
+  vehicleGetById
 } = require("../controllers/vehicleController");
 
 const { authenticateToken } = require("../middleware/auth");
+
+router.get("/", vehicleGet);
+router.get("/:id", vehicleGetById);
 
 // Crear vehículo (requiere login)
 router.post("/", authenticateToken, vehiclePost);
