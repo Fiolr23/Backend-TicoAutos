@@ -1,177 +1,316 @@
+const fs = require("fs/promises");
+const path = require("path");
+const mongoose = require("mongoose");
+
 const Vehicle = require("../models/vehicle");
+const {
+  buildVehicleFilters,
+  normalizeKeepImages,
+  validateVehiclePayload,
+} = require("../validations/vehicleValidation");
 
-// POST - Crear vehículo
-const vehiclePost = async (req, res) => {
-  // Se crea un nuevo vehículo con los datos enviados en el body
-  const vehicle = new Vehicle({
-    brand: req.body.brand,
-    model: req.body.model,
-    year: req.body.year,
-    price: req.body.price,
-    color: req.body.color,
-    userId: req.user._id // usuario que creó el vehículo
-  });
-  try {
-    // Guarda el vehículo en la base de datos
-    const vehicleCreated = await vehicle.save();
+const VEHICLE_UPLOADS_DIR = path.join(__dirname, "..", "uploads", "vehicles");
 
-    // Header con la ubicación del nuevo recurso creado
-    res.header("Location", `/api/vehicles?id=${vehicleCreated._id}`);
-    res.status(201).json(vehicleCreated);
-  } catch (error) {
-    res.status(400).json({ message: error.message });
-  }
+const isValidObjectId = (value) => mongoose.Types.ObjectId.isValid(value);
+
+const toPublicImagePath = (file) => `/uploads/vehicles/${path.basename(file.filename || file.path || "")}`;
+
+const cleanupUploadedFiles = async (files = []) => {
+  await Promise.all(
+    files.map(async (file) => {
+      const filename = path.basename(file.filename || file.path || "");
+      if (!filename) {
+        return;
+      }
+
+      try {
+        await fs.unlink(path.join(VEHICLE_UPLOADS_DIR, filename));
+      } catch (error) {
+        if (error.code !== "ENOENT") {
+          console.error("No se pudo borrar el archivo temporal:", error);
+        }
+      }
+    })
+  );
 };
 
-// PUT - Editar vehículo
-const vehiclePut = async (req, res) => {
-  try {
-    // Primero se busca el vehículo
-    const vehicle = await Vehicle.findById(req.params.id);
+const cleanupImagePaths = async (imagePaths = []) => {
+  await Promise.all(
+    imagePaths.map(async (imagePath) => {
+      const filename = path.basename(imagePath || "");
+      if (!filename) {
+        return;
+      }
 
-    if (!vehicle) {
-      return res.status(404).json({ message: "Vehicle not found" });
-    }
-    // Se verifica que el usuario autenticado sea el dueño
-    if (vehicle.userId.toString() !== req.user._id.toString()) {
-      return res.status(403).json({ message: "You cannot edit this vehicle" });
-    }
-
-    // Si es el dueño, se permite la actualización
-    const vehicleUpdated = await Vehicle.findByIdAndUpdate(
-      req.params.id,
-      {
-        brand: req.body.brand,
-        model: req.body.model,
-        year: req.body.year,
-        price: req.body.price,
-        color: req.body.color
-      },
-      { new: true }
-    );
-    res.status(200).json(vehicleUpdated);
-  } catch (error) {
-    res.status(400).json({ message: error.message });
-  }
+      try {
+        await fs.unlink(path.join(VEHICLE_UPLOADS_DIR, filename));
+      } catch (error) {
+        if (error.code !== "ENOENT") {
+          console.error("No se pudo borrar la imagen del vehiculo:", error);
+        }
+      }
+    })
+  );
 };
 
-// DELETE - Eliminar vehículo
-const vehicleDelete = async (req, res) => {
-  try {
-    const vehicle = await Vehicle.findById(req.params.id);
-    if (!vehicle) {
-      return res.status(404).json({ message: "Vehicle not found" });
-    }
-    // Solo el dueño puede eliminarlo
-    if (vehicle.userId.toString() !== req.user._id.toString()) {
-      return res.status(403).json({ message: "You cannot delete this vehicle" });
-    }
-    await Vehicle.findByIdAndDelete(req.params.id);
-    res.status(200).json({ message: "Vehicle deleted successfully" });
-  } catch (error) {
-    res.status(500).json({ message: error.message });
-  }
+const serializeVehicle = (vehicle) => {
+  const data = vehicle.toObject ? vehicle.toObject() : vehicle;
+  const owner = data.userId && typeof data.userId === "object" ? data.userId : null;
+
+  return {
+    ...data,
+    owner,
+  };
 };
 
-// PATCH - Marcar como vendido
-const vehicleSold = async (req, res) => {
+const getVehicles = async (req, res) => {
   try {
-    const vehicle = await Vehicle.findById(req.params.id);
-    if (!vehicle) {
-      return res.status(404).json({ message: "Vehicle not found" });
-    }
-    // Solo el dueño puede marcarlo como vendido
-    if (vehicle.userId.toString() !== req.user._id.toString()) {
-      return res.status(403).json({ message: "You cannot modify this vehicle" });
-    }
-    vehicle.status = "vendido";
-    await vehicle.save();
-    res.status(200).json(vehicle);
-  } catch (error) {
-    res.status(500).json({ message: error.message });
-  }
-};
+    const { filters, page, limit, skip } = buildVehicleFilters(req.query);
 
-// GET - Obtener vehículos con filtros y paginación
-const vehicleGet = async (req, res) => {
-  try {
-    const {
-      brand,
-      model,
-      minYear,
-      maxYear,
-      minPrice,
-      maxPrice,
-      status,
-      page = 1,   
-      limit = 10  
-    } = req.query;
+    const [results, total] = await Promise.all([
+      Vehicle.find(filters)
+        .populate("userId", "name lastname email")
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit),
+      Vehicle.countDocuments(filters),
+    ]);
 
-    // Objeto donde se irán agregando los filtros dinámicamente
-    const filters = {};
-
-    if (brand) filters.brand = brand;
-    if (model) filters.model = model;
-    if (status) filters.status = status;
-
-    // Filtro por rango de año
-    if (minYear || maxYear) {
-      filters.year = {};
-      if (minYear) filters.year.$gte = Number(minYear);
-      if (maxYear) filters.year.$lte = Number(maxYear);
-    }
-    // Filtro por rango de precio
-    if (minPrice || maxPrice) {
-      filters.price = {};
-      if (minPrice) filters.price.$gte = Number(minPrice);
-      if (maxPrice) filters.price.$lte = Number(maxPrice);
-    }
-    // Se calcula cuántos registros saltar para la paginación
-    const skip = (Number(page) - 1) * Number(limit);
-
-    // Consulta a la base de datos con los filtros aplicados
-    const vehicles = await Vehicle.find(filters)
-      .populate("userId", "name lastname")
-      .skip(skip)
-      .limit(Number(limit));
-
-    // Cuenta cuántos vehículos existen con esos filtros
-    const total = await Vehicle.countDocuments(filters);
-
-    res.status(200).json({
+    return res.json({
       total,
-      page: Number(page),
-      limit: Number(limit),
-      results: vehicles
+      totalPages: Math.max(1, Math.ceil(total / limit)),
+      page,
+      limit,
+      results: results.map(serializeVehicle),
     });
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    console.error("Error listando vehiculos:", error);
+    return res.status(500).json({ message: "No se pudieron cargar los vehiculos" });
   }
 };
 
-// GET - Obtener un vehículo específico por id
-const vehicleGetById = async (req, res) => {
+const getMyVehicles = async (req, res) => {
   try {
-    // Busca el vehículo usando el id que viene en la URL
-    const vehicle = await Vehicle
-      .findById(req.params.id)
+    const { page, limit, skip } = buildVehicleFilters(req.query);
+    const filters = { userId: req.user._id };
 
-      .populate("userId", "name lastname");
+    const [results, total] = await Promise.all([
+      Vehicle.find(filters)
+        .populate("userId", "name lastname email")
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit),
+      Vehicle.countDocuments(filters),
+    ]);
 
-    if (!vehicle) {
-      return res.status(404).json({ message: "Vehicle not found" });
-    }
-    res.status(200).json(vehicle);
+    return res.json({
+      total,
+      totalPages: Math.max(1, Math.ceil(total / limit)),
+      page,
+      limit,
+      results: results.map(serializeVehicle),
+    });
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    console.error("Error listando mis vehiculos:", error);
+    return res.status(500).json({ message: "No se pudieron cargar tus vehiculos" });
+  }
+};
+
+const getVehicleById = async (req, res) => {
+  try {
+    if (!isValidObjectId(req.params.id)) {
+      return res.status(400).json({ message: "ID de vehiculo invalido" });
+    }
+
+    const vehicle = await Vehicle.findById(req.params.id).populate("userId", "name lastname email");
+    if (!vehicle) {
+      return res.status(404).json({ message: "Vehiculo no encontrado" });
+    }
+
+    return res.json(serializeVehicle(vehicle));
+  } catch (error) {
+    console.error("Error cargando el vehiculo:", error);
+    return res.status(500).json({ message: "No se pudo cargar el vehiculo" });
+  }
+};
+
+const createVehicle = async (req, res) => {
+  const uploadedFiles = req.files || [];
+
+  try {
+    const validation = validateVehiclePayload(req.body, {
+      requireImages: true,
+      imageCount: uploadedFiles.length,
+    });
+
+    if (!validation.ok) {
+      await cleanupUploadedFiles(uploadedFiles);
+      return res.status(400).json({ message: validation.message });
+    }
+
+    const vehicle = await Vehicle.create({
+      ...validation.data,
+      userId: req.user._id,
+      images: uploadedFiles.map(toPublicImagePath),
+    });
+
+    const populatedVehicle = await Vehicle.findById(vehicle._id).populate("userId", "name lastname email");
+    return res.status(201).json(serializeVehicle(populatedVehicle));
+  } catch (error) {
+    await cleanupUploadedFiles(uploadedFiles);
+    console.error("Error creando vehiculo:", error);
+    return res.status(500).json({ message: "No se pudo crear el vehiculo" });
+  }
+};
+
+const updateVehicle = async (req, res) => {
+  const uploadedFiles = req.files || [];
+
+  try {
+    if (!isValidObjectId(req.params.id)) {
+      await cleanupUploadedFiles(uploadedFiles);
+      return res.status(400).json({ message: "ID de vehiculo invalido" });
+    }
+
+    const vehicle = await Vehicle.findById(req.params.id);
+    if (!vehicle) {
+      await cleanupUploadedFiles(uploadedFiles);
+      return res.status(404).json({ message: "Vehiculo no encontrado" });
+    }
+
+    if (vehicle.userId.toString() !== req.user._id.toString()) {
+      await cleanupUploadedFiles(uploadedFiles);
+      return res.status(403).json({ message: "No puedes editar este vehiculo" });
+    }
+
+    const keepImages = normalizeKeepImages(req.body.keepImages).filter((image) => vehicle.images.includes(image));
+    const nextImages = [...keepImages, ...uploadedFiles.map(toPublicImagePath)];
+
+    if (nextImages.length > 6) {
+      await cleanupUploadedFiles(uploadedFiles);
+      return res.status(400).json({ message: "Solo puedes guardar hasta 6 imagenes" });
+    }
+
+    const validation = validateVehiclePayload(req.body, {
+      requireImages: false,
+      imageCount: nextImages.length,
+    });
+
+    if (!validation.ok) {
+      await cleanupUploadedFiles(uploadedFiles);
+      return res.status(400).json({ message: validation.message });
+    }
+
+    if (!nextImages.length) {
+      await cleanupUploadedFiles(uploadedFiles);
+      return res.status(400).json({ message: "Debes conservar o subir al menos una imagen" });
+    }
+
+    const removedImages = vehicle.images.filter((image) => !keepImages.includes(image));
+
+    Object.assign(vehicle, validation.data, { images: nextImages });
+    await vehicle.save();
+    await cleanupImagePaths(removedImages);
+
+    const populatedVehicle = await Vehicle.findById(vehicle._id).populate("userId", "name lastname email");
+    return res.json(serializeVehicle(populatedVehicle));
+  } catch (error) {
+    await cleanupUploadedFiles(uploadedFiles);
+    console.error("Error actualizando vehiculo:", error);
+    return res.status(500).json({ message: "No se pudo actualizar el vehiculo" });
+  }
+};
+
+const deleteVehicle = async (req, res) => {
+  try {
+    if (!isValidObjectId(req.params.id)) {
+      return res.status(400).json({ message: "ID de vehiculo invalido" });
+    }
+
+    const vehicle = await Vehicle.findById(req.params.id);
+    if (!vehicle) {
+      return res.status(404).json({ message: "Vehiculo no encontrado" });
+    }
+
+    if (vehicle.userId.toString() !== req.user._id.toString()) {
+      return res.status(403).json({ message: "No puedes eliminar este vehiculo" });
+    }
+
+    const imagesToDelete = [...vehicle.images];
+    await vehicle.deleteOne();
+    await cleanupImagePaths(imagesToDelete);
+
+    return res.json({ message: "Vehiculo eliminado correctamente" });
+  } catch (error) {
+    console.error("Error eliminando vehiculo:", error);
+    return res.status(500).json({ message: "No se pudo eliminar el vehiculo" });
+  }
+};
+
+const markVehicleAsSold = async (req, res) => {
+  try {
+    if (!isValidObjectId(req.params.id)) {
+      return res.status(400).json({ message: "ID de vehiculo invalido" });
+    }
+
+    const vehicle = await Vehicle.findById(req.params.id);
+    if (!vehicle) {
+      return res.status(404).json({ message: "Vehiculo no encontrado" });
+    }
+
+    if (vehicle.userId.toString() !== req.user._id.toString()) {
+      return res.status(403).json({ message: "No puedes actualizar este vehiculo" });
+    }
+
+    vehicle.status = "vendido";
+    await vehicle.save();
+
+    const populatedVehicle = await Vehicle.findById(vehicle._id).populate("userId", "name lastname email");
+    return res.json(serializeVehicle(populatedVehicle));
+  } catch (error) {
+    console.error("Error marcando vehiculo como vendido:", error);
+    return res.status(500).json({ message: "No se pudo marcar el vehiculo como vendido" });
+  }
+};
+
+const updateVehicleStatus = async (req, res) => {
+  try {
+    if (!isValidObjectId(req.params.id)) {
+      return res.status(400).json({ message: "ID de vehiculo invalido" });
+    }
+
+    const { status } = req.body;
+    if (!["disponible", "vendido"].includes(status)) {
+      return res.status(400).json({ message: "El estado del vehiculo es invalido" });
+    }
+
+    const vehicle = await Vehicle.findById(req.params.id);
+    if (!vehicle) {
+      return res.status(404).json({ message: "Vehiculo no encontrado" });
+    }
+
+    if (vehicle.userId.toString() !== req.user._id.toString()) {
+      return res.status(403).json({ message: "No puedes actualizar este vehiculo" });
+    }
+
+    vehicle.status = status;
+    await vehicle.save();
+
+    const populatedVehicle = await Vehicle.findById(vehicle._id).populate("userId", "name lastname email");
+    return res.json(serializeVehicle(populatedVehicle));
+  } catch (error) {
+    console.error("Error actualizando el estado del vehiculo:", error);
+    return res.status(500).json({ message: "No se pudo actualizar el estado del vehiculo" });
   }
 };
 
 module.exports = {
-  vehiclePost,
-  vehiclePut,
-  vehicleDelete,
-  vehicleSold,
-  vehicleGet,
-  vehicleGetById
+  createVehicle,
+  deleteVehicle,
+  getMyVehicles,
+  getVehicleById,
+  getVehicles,
+  markVehicleAsSold,
+  updateVehicleStatus,
+  updateVehicle,
 };
