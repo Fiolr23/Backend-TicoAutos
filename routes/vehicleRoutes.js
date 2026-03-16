@@ -1,30 +1,37 @@
 const express = require("express");
-const router = express.Router();
-
-const {
-  vehiclePost,
-  vehiclePut,
-  vehicleDelete,
-  vehicleSold,
-  vehicleGet,
-  vehicleGetById
-} = require("../controllers/vehicleController");
 
 const { authenticateToken } = require("../middleware/auth");
+const { uploadVehicleImages } = require("../middleware/uploadVehicleImages");
+const {
+  createVehicle,
+  deleteVehicle,
+  getMyVehicles,
+  getVehicleById,
+  getVehicles,
+  markVehicleAsSold,
+  updateVehicleStatus,
+  updateVehicle,
+} = require("../controllers/vehicleController");
 
-router.get("/", vehicleGet);
-router.get("/:id", vehicleGetById);
+const router = express.Router();
 
-// Crear vehículo (requiere login)
-router.post("/", authenticateToken, vehiclePost);
+const runVehicleUpload = (req, res, next) => {
+  uploadVehicleImages(req, res, (error) => {
+    if (error) {
+      return res.status(400).json({ message: error.message });
+    }
 
-// Editar vehículo
-router.put("/:id", authenticateToken, vehiclePut);
+    return next();
+  });
+};
 
-// Eliminar vehículo
-router.delete("/:id", authenticateToken, vehicleDelete);
-
-// Marcar vehículo como vendido
-router.patch("/:id/sold", authenticateToken, vehicleSold);
+router.get("/", getVehicles);
+router.get("/mine", authenticateToken, getMyVehicles);
+router.get("/:id", getVehicleById);
+router.post("/", authenticateToken, runVehicleUpload, createVehicle);
+router.put("/:id", authenticateToken, runVehicleUpload, updateVehicle);
+router.delete("/:id", authenticateToken, deleteVehicle);
+router.patch("/:id/sold", authenticateToken, markVehicleAsSold);
+router.patch("/:id/status", authenticateToken, updateVehicleStatus);
 
 module.exports = router;
