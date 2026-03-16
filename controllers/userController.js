@@ -32,7 +32,6 @@ const register = async (req, res) => {
       lastname: lastname.trim(),
       email: email.toLowerCase().trim(),
       password: hashedPassword,
-      token: null,
     });
 
     // No devolver password
