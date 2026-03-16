@@ -1,206 +1,118 @@
 const mongoose = require("mongoose");
-const Conversation = require("../models/conversation");
-const Message = require("../models/message");
 const Vehicle = require("../models/vehicle");
+const Question = require("../models/question");
 
-// Controlador de mensajeria.
-// Cada conversacion representa un hilo por vehiculo entre propietario e interesado.
-const THREAD_POPULATE = [
+// Populate reutilizable para traer la información relacionada de vehículo y usuarios.
+const QUESTION_POPULATE = [
   {
     path: "vehicleId",
-    select: "brand model year price color status images userId createdAt",
-    populate: { path: "userId", select: "name lastname" },
+    select: "brand model year price color status images location",
   },
-  { path: "ownerId", select: "name lastname" },
-  { path: "interestedUserId", select: "name lastname" },
+  { path: "ownerId", select: "name lastname email" },
+  { path: "askedByUserId", select: "name lastname email" },
+  { path: "answeredByUserId", select: "name lastname email" },
 ];
 
-const MESSAGE_POPULATE = [
-  { path: "senderId", select: "name lastname" },
-  { path: "receiverId", select: "name lastname" },
-];
-
+// Valida si un valor tiene formato válido de ObjectId de MongoDB.
 const isValidObjectId = (value) => mongoose.Types.ObjectId.isValid(value);
 
-const normalizeMessageText = (value) => value?.trim();
-
+// Normaliza y valida los parámetros de paginación.
 const normalizePagination = (query) => {
   const page = Number.parseInt(query.page, 10) || 1;
   const limit = Number.parseInt(query.limit, 10) || 10;
 
-  if (page < 1 || limit < 1 || limit > 50) {
+  if (page < 1 || limit < 1 || limit > 100) {
     return null;
   }
 
   return { page, limit, skip: (page - 1) * limit };
 };
 
-// Devuelve una conversacion lista para el frontend, con mensajes ordenados por fecha.
-const serializeConversation = async (conversation, currentUserId) => {
-  const messages = await Message.find({ conversationId: conversation._id })
-    .populate(MESSAGE_POPULATE)
-    .sort({ sentAt: 1 });
-
-  return {
-    ...conversation.toObject(),
-    isOwner: conversation.ownerId._id.toString() === currentUserId.toString(),
-    messages,
-  };
-};
-
-// Reutiliza la conversacion si ya existe para ese vehiculo y esos dos usuarios.
-const getOrCreateConversation = async ({ vehicle, interestedUserId }) => {
-  let conversation = await Conversation.findOne({
-    vehicleId: vehicle._id,
-    ownerId: vehicle.userId,
-    interestedUserId,
-  }).populate(THREAD_POPULATE);
-
-  if (!conversation) {
-    conversation = await Conversation.create({
-      vehicleId: vehicle._id,
-      ownerId: vehicle.userId,
-      interestedUserId,
-      lastMessageAt: new Date(),
-    });
-
-    conversation = await Conversation.findById(conversation._id).populate(THREAD_POPULATE);
-  }
-
-  return conversation;
-};
-
-const sendMessageToVehicleOwner = async (req, res) => {
+// Crea una nueva pregunta sobre un vehículo.
+const askQuestion = async (req, res) => {
   try {
-    const vehicleId = req.params.id;
-    const text = normalizeMessageText(req.body.text);
+    const vehicleId = req.params.vehicleId;
+    const questionText = req.body.questionText?.trim();
 
     if (!isValidObjectId(vehicleId)) {
-      return res.status(400).json({ message: "Vehicle id invalido" });
+      return res.status(400).json({ message: "El identificador del vehiculo no es valido." });
     }
 
-    if (!text || text.length < 1) {
-      return res.status(400).json({ message: "El mensaje es obligatorio" });
+    if (!questionText) {
+      return res.status(400).json({ message: "Debes ingresar una pregunta." });
+    }
+
+    if (questionText.length > 1000) {
+      return res.status(400).json({ message: "La pregunta no puede superar los 1000 caracteres." });
     }
 
     const vehicle = await Vehicle.findById(vehicleId);
     if (!vehicle) {
-      return res.status(404).json({ message: "Vehicle not found" });
+      return res.status(404).json({ message: "El vehiculo solicitado no fue encontrado." });
     }
 
+    // Evita que el dueño pregunte sobre su propio vehículo.
     if (vehicle.userId.toString() === req.user._id.toString()) {
-      return res.status(400).json({ message: "No puedes enviarte mensajes a ti mismo" });
+      return res.status(400).json({ message: "No puedes realizar preguntas sobre tu propio vehiculo." });
     }
 
-    let conversation = await getOrCreateConversation({
-      vehicle,
-      interestedUserId: req.user._id,
-    });
-
-    // El historial se guarda mensaje por mensaje para poder reconstruir la conversacion completa.
-    await Message.create({
-      conversationId: conversation._id,
-      vehicleId: vehicle._id,
-      senderId: req.user._id,
-      receiverId: vehicle.userId,
-      text,
-      sentAt: new Date(),
-    });
-
-    // Cuando escribe el interesado, queda un pendiente para el propietario.
-    conversation.ownerUnreadCount += 1;
-    conversation.interestedUnreadCount = 0;
-    conversation.lastMessageAt = new Date();
-    conversation.lastMessageText = text;
-    await conversation.save();
-
-    conversation = await Conversation.findById(conversation._id).populate(THREAD_POPULATE);
-
-    return res.status(201).json(await serializeConversation(conversation, req.user._id));
-  } catch (error) {
-    return res.status(500).json({ message: error.message });
-  }
-};
-
-const getVehicleConversation = async (req, res) => {
-  try {
-    const vehicleId = req.params.id;
-
-    if (!isValidObjectId(vehicleId)) {
-      return res.status(400).json({ message: "Vehicle id invalido" });
-    }
-
-    const vehicle = await Vehicle.findById(vehicleId).populate("userId", "name lastname");
-    if (!vehicle) {
-      return res.status(404).json({ message: "Vehicle not found" });
-    }
-
-    // El propietario no necesita abrir una conversacion consigo mismo desde el detalle.
-    if (vehicle.userId._id.toString() === req.user._id.toString()) {
-      return res.status(200).json({
-        vehicle,
-        isOwner: true,
-        conversation: null,
-        messages: [],
-      });
-    }
-
-    const conversation = await Conversation.findOne({
+    // El interesado debe esperar respuesta antes de poder volver a preguntar
+    // sobre el mismo vehiculo.
+    const pendingQuestion = await Question.findOne({
       vehicleId,
-      ownerId: vehicle.userId._id,
-      interestedUserId: req.user._id,
-    }).populate(THREAD_POPULATE);
+      askedByUserId: req.user._id,
+      status: "pending",
+    });
 
-    if (!conversation) {
-      return res.status(200).json({
-        vehicle,
-        isOwner: false,
-        conversation: null,
-        messages: [],
+    // El interesado debe esperar respuesta antes de poder volver a preguntar
+    // sobre el mismo vehiculo.
+    if (pendingQuestion) {
+      return res.status(409).json({
+        message: "Ya tienes una pregunta pendiente para este vehiculo. Debes esperar la respuesta del propietario.",
       });
     }
 
-    const messages = await Message.find({ conversationId: conversation._id })
-      .populate(MESSAGE_POPULATE)
-      .sort({ sentAt: 1 });
-
-    // Si el interesado abre el hilo, sus pendientes se limpian.
-    if (conversation.interestedUnreadCount > 0) {
-      conversation.interestedUnreadCount = 0;
-      await conversation.save();
-    }
-
-    return res.status(200).json({
-      vehicle,
-      isOwner: false,
-      conversation,
-      messages,
+    // Registra la nueva pregunta.
+    const question = await Question.create({
+      vehicleId,
+      ownerId: vehicle.userId,
+      askedByUserId: req.user._id,
+      questionText,
+      askedAt: new Date(),
     });
+
+    // Devuelve la pregunta con datos relacionados poblados.
+    const populatedQuestion = await Question.findById(question._id).populate(QUESTION_POPULATE);
+
+    return res.status(201).json(populatedQuestion);
   } catch (error) {
-    return res.status(500).json({ message: error.message });
+    console.error("Error creating question:", error);
+    return res.status(500).json({ message: "No fue posible registrar la pregunta." });
   }
 };
 
-const getMyConversations = async (req, res) => {
+// Obtiene las preguntas realizadas por el usuario autenticado.
+const getMyQuestions = async (req, res) => {
   try {
     const pagination = normalizePagination(req.query);
+
     if (!pagination) {
-      return res.status(400).json({ message: "Los parametros page y limit son invalidos" });
+      return res.status(400).json({ message: "Los parametros de paginacion son invalidos." });
     }
 
     const { page, limit, skip } = pagination;
-    const filters = { interestedUserId: req.user._id };
 
+    // Ejecuta consulta paginada y conteo total en paralelo.
     const [results, total] = await Promise.all([
-      Conversation.find(filters)
-        .populate(THREAD_POPULATE)
-        .sort({ lastMessageAt: -1 })
+      Question.find({ askedByUserId: req.user._id })
+        .populate(QUESTION_POPULATE)
+        .sort({ askedAt: -1 })
         .skip(skip)
         .limit(limit),
-      Conversation.countDocuments(filters),
+      Question.countDocuments({ askedByUserId: req.user._id }),
     ]);
 
-    return res.status(200).json({
+    return res.json({
       total,
       totalPages: Math.ceil(total / limit) || 1,
       page,
@@ -208,156 +120,221 @@ const getMyConversations = async (req, res) => {
       results,
     });
   } catch (error) {
-    return res.status(500).json({ message: error.message });
+    console.error("Error loading user questions:", error);
+    return res.status(500).json({ message: "No fue posible cargar tus preguntas." });
   }
 };
 
-const getOwnerInbox = async (req, res) => {
+// Obtiene las preguntas recibidas por el propietario.
+const getOwnerQuestions = async (req, res) => {
   try {
     const pagination = normalizePagination(req.query);
+
     if (!pagination) {
-      return res.status(400).json({ message: "Los parametros page y limit son invalidos" });
+      return res.status(400).json({ message: "Los parametros de paginacion son invalidos." });
     }
 
-    const { page, limit, skip } = pagination;
     const filters = { ownerId: req.user._id };
 
-    // Permite pedir solo conversaciones con mensajes pendientes.
-    if (req.query.status === "pending") {
-      filters.ownerUnreadCount = { $gt: 0 };
+    // Filtra por vehículo si se envía en query.
+    if (req.query.vehicleId) {
+      if (!isValidObjectId(req.query.vehicleId)) {
+        return res.status(400).json({ message: "El identificador del vehiculo no es valido." });
+      }
+
+      filters.vehicleId = req.query.vehicleId;
     }
 
-    const [results, total, pendingTotal] = await Promise.all([
-      Conversation.find(filters)
-        .populate(THREAD_POPULATE)
-        .sort({ lastMessageAt: -1 })
+    // Filtra por estado solo si el valor es permitido.
+    if (req.query.status && ["pending", "answered"].includes(req.query.status)) {
+      filters.status = req.query.status;
+    }
+
+    const { page, limit, skip } = pagination;
+
+    const [results, total] = await Promise.all([
+      Question.find(filters)
+        .populate(QUESTION_POPULATE)
+        .sort({ askedAt: -1 })
         .skip(skip)
         .limit(limit),
-      Conversation.countDocuments(filters),
-      Conversation.countDocuments({ ownerId: req.user._id, ownerUnreadCount: { $gt: 0 } }),
+      Question.countDocuments(filters),
     ]);
 
-    return res.status(200).json({
+    return res.json({
       total,
-      pendingTotal,
       totalPages: Math.ceil(total / limit) || 1,
       page,
       limit,
       results,
     });
   } catch (error) {
-    return res.status(500).json({ message: error.message });
+    console.error("Error loading owner questions:", error);
+    return res.status(500).json({ message: "No fue posible cargar las preguntas recibidas." });
   }
 };
 
-const getConversationById = async (req, res) => {
+// Obtiene el historial de preguntas de un vehículo.
+const getVehicleQuestions = async (req, res) => {
   try {
-    const conversationId = req.params.id;
+    const vehicleId = req.params.vehicleId;
 
-    if (!isValidObjectId(conversationId)) {
-      return res.status(400).json({ message: "Conversation id invalido" });
+    if (!isValidObjectId(vehicleId)) {
+      return res.status(400).json({ message: "El identificador del vehiculo no es valido." });
     }
 
-    const conversation = await Conversation.findById(conversationId).populate(THREAD_POPULATE);
-    if (!conversation) {
-      return res.status(404).json({ message: "Conversation not found" });
+    const vehicle = await Vehicle.findById(vehicleId).populate("userId", "name lastname email");
+    if (!vehicle) {
+      return res.status(404).json({ message: "El vehiculo solicitado no fue encontrado." });
     }
 
-    const currentUserId = req.user._id.toString();
-    const isOwner = conversation.ownerId._id.toString() === currentUserId;
-    const isInterested = conversation.interestedUserId._id.toString() === currentUserId;
+    const isOwner = vehicle.userId._id.toString() === req.user._id.toString();
+    const filters = { vehicleId };
 
-    // Solo pueden abrir la conversacion las dos personas asociadas a ese vehiculo.
-    if (!isOwner && !isInterested) {
-      return res.status(403).json({ message: "No puedes ver esta conversacion" });
+    // El propietario ve todo el historial del vehiculo.
+    // El interesado solo ve las preguntas que el mismo realizo.
+    if (!isOwner) {
+      filters.askedByUserId = req.user._id;
     }
 
-    const messages = await Message.find({ conversationId })
-      .populate(MESSAGE_POPULATE)
-      .sort({ sentAt: 1 });
+    const results = await Question.find(filters)
+      .populate(QUESTION_POPULATE)
+      .sort({ askedAt: 1 });
 
-    if (isOwner && conversation.ownerUnreadCount > 0) {
-      conversation.ownerUnreadCount = 0;
-      await conversation.save();
-    }
-
-    if (isInterested && conversation.interestedUnreadCount > 0) {
-      conversation.interestedUnreadCount = 0;
-      await conversation.save();
-    }
-
-    return res.status(200).json({
-      ...conversation.toObject(),
+    return res.json({
+      vehicle,
       isOwner,
-      messages,
+      canAsk: !isOwner && !results.some((question) => question.status === "pending"),
+      results,
     });
   } catch (error) {
-    return res.status(500).json({ message: error.message });
+    console.error("Error loading vehicle questions:", error);
+    return res.status(500).json({ message: "No fue posible cargar el historial de preguntas." });
   }
 };
 
-const replyToConversation = async (req, res) => {
+// Permite al propietario responder una pregunta.
+const answerQuestion = async (req, res) => {
   try {
-    const conversationId = req.params.id;
-    const text = normalizeMessageText(req.body.text);
+    const questionId = req.params.id;
+    const answerText = req.body.answerText?.trim();
 
-    if (!isValidObjectId(conversationId)) {
-      return res.status(400).json({ message: "Conversation id invalido" });
+    if (!isValidObjectId(questionId)) {
+      return res.status(400).json({ message: "El identificador de la pregunta no es valido." });
     }
 
-    if (!text || text.length < 1) {
-      return res.status(400).json({ message: "El mensaje es obligatorio" });
+    if (!answerText) {
+      return res.status(400).json({ message: "Debes ingresar una respuesta." });
     }
 
-    const conversation = await Conversation.findById(conversationId).populate(THREAD_POPULATE);
-    if (!conversation) {
-      return res.status(404).json({ message: "Conversation not found" });
+    if (answerText.length > 1000) {
+      return res.status(400).json({ message: "La respuesta no puede superar los 1000 caracteres." });
     }
 
-    const currentUserId = req.user._id.toString();
-    const isOwner = conversation.ownerId._id.toString() === currentUserId;
-    const isInterested = conversation.interestedUserId._id.toString() === currentUserId;
-
-    if (!isOwner && !isInterested) {
-      return res.status(403).json({ message: "No puedes participar en esta conversacion" });
+    const question = await Question.findById(questionId);
+    if (!question) {
+      return res.status(404).json({ message: "La pregunta solicitada no fue encontrada." });
     }
 
-    const receiverId = isOwner ? conversation.interestedUserId._id : conversation.ownerId._id;
+    // Solo el dueño del vehículo puede responder.
+    if (question.ownerId.toString() !== req.user._id.toString()) {
+      return res.status(403).json({ message: "Solo el propietario del vehiculo puede responder esta pregunta." });
+    }
 
-    await Message.create({
-      conversationId: conversation._id,
-      vehicleId: conversation.vehicleId._id,
-      senderId: req.user._id,
-      receiverId,
-      text,
-      sentAt: new Date(),
+    // Evita responder dos veces la misma pregunta.
+    if (question.status === "answered") {
+      return res.status(400).json({ message: "Esta pregunta ya fue respondida anteriormente." });
+    }
+
+    // Actualiza los datos de la respuesta.
+    question.answerText = answerText;
+    question.answeredAt = new Date();
+    question.answeredByUserId = req.user._id;
+    question.status = "answered";
+    await question.save();
+
+    const populatedQuestion = await Question.findById(question._id).populate(QUESTION_POPULATE);
+
+    return res.json(populatedQuestion);
+  } catch (error) {
+    console.error("Error answering question:", error);
+    return res.status(500).json({ message: "No fue posible registrar la respuesta." });
+  }
+};
+
+// Construye la bandeja de chats del usuario.
+const getChats = async (req, res) => {
+  try {
+    const questions = await Question.find({
+      $or: [{ askedByUserId: req.user._id }, { ownerId: req.user._id }],
+    })
+      .populate(QUESTION_POPULATE)
+      .sort({ askedAt: -1 });
+
+    const chatsMap = new Map();
+
+    // Se resume el historial en una sola entrada por vehiculo para construir
+    // la bandeja principal de chats.
+    questions.forEach((question) => {
+      const vehicle = question.vehicleId;
+      const vehicleId = vehicle?._id?.toString();
+
+      if (!vehicleId) {
+        return;
+      }
+
+      const isOwner = question.ownerId?._id?.toString() === req.user._id.toString();
+      const otherUser = isOwner ? question.askedByUserId : question.ownerId;
+      const currentChat = chatsMap.get(vehicleId);
+
+      // Si es la primera pregunta del vehículo, crea el resumen inicial.
+      if (!currentChat) {
+        chatsMap.set(vehicleId, {
+          vehicle,
+          isOwner,
+          otherUser,
+          totalMessages: 1,
+          hasPendingQuestion: question.status === "pending",
+          lastActivityAt: question.answeredAt || question.askedAt,
+          lastQuestionText: question.questionText,
+        });
+        return;
+      }
+
+      currentChat.totalMessages += 1;
+
+      if (question.status === "pending") {
+        currentChat.hasPendingQuestion = true;
+      }
+
+      const currentDate = new Date(currentChat.lastActivityAt || 0);
+      const questionDate = new Date(question.answeredAt || question.askedAt || 0);
+
+      // Mantiene la actividad más reciente del chat.
+      if (questionDate > currentDate) {
+        currentChat.lastActivityAt = question.answeredAt || question.askedAt;
+        currentChat.lastQuestionText = question.questionText;
+        currentChat.otherUser = otherUser;
+        currentChat.isOwner = isOwner;
+      }
     });
 
-    conversation.lastMessageAt = new Date();
-    conversation.lastMessageText = text;
-
-    // Los pendientes cambian segun quien envio el ultimo mensaje.
-    if (isOwner) {
-      conversation.interestedUnreadCount += 1;
-      conversation.ownerUnreadCount = 0;
-    } else {
-      conversation.ownerUnreadCount += 1;
-      conversation.interestedUnreadCount = 0;
-    }
-
-    await conversation.save();
-
-    return res.status(201).json(await serializeConversation(conversation, req.user._id));
+    return res.json({
+      results: Array.from(chatsMap.values()).sort(
+        (current, next) => new Date(next.lastActivityAt) - new Date(current.lastActivityAt)
+      ),
+    });
   } catch (error) {
-    return res.status(500).json({ message: error.message });
+    console.error("Error loading chats:", error);
+    return res.status(500).json({ message: "No fue posible cargar los chats." });
   }
 };
 
 module.exports = {
-  sendMessageToVehicleOwner,
-  getVehicleConversation,
-  getMyConversations,
-  getOwnerInbox,
-  getConversationById,
-  replyToConversation,
+  answerQuestion,
+  askQuestion,
+  getChats,
+  getMyQuestions,
+  getOwnerQuestions,
+  getVehicleQuestions,
 };

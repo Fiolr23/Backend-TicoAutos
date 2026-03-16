@@ -3,15 +3,20 @@ const router = express.Router();
 
 const { authenticateToken } = require("../middleware/auth");
 const {
-  getMyConversations,
-  getOwnerInbox,
-  getConversationById,
-  replyToConversation,
+  answerQuestion,
+  askQuestion,
+  getChats,
+  getMyQuestions,
+  getOwnerQuestions,
+  getVehicleQuestions,
 } = require("../controllers/messageController");
 
-router.get("/mine", authenticateToken, getMyConversations);
-router.get("/inbox", authenticateToken, getOwnerInbox);
-router.get("/conversations/:id", authenticateToken, getConversationById);
-router.post("/conversations/:id/messages", authenticateToken, replyToConversation);
+router.get("/chats", authenticateToken, getChats);
+router.post("/vehicle/:vehicleId", authenticateToken, askQuestion);
+router.get("/mine", authenticateToken, getMyQuestions);
+router.get("/owner", authenticateToken, getOwnerQuestions);
+router.get("/vehicle/:vehicleId", authenticateToken, getVehicleQuestions);
+router.post("/:id/answer", authenticateToken, answerQuestion);
 
 module.exports = router;
+
