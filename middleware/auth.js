@@ -1,12 +1,40 @@
 const User = require("../models/user");
 const bcrypt = require("bcryptjs");
+const jwt = require("jsonwebtoken");
+
+const JWT_SECRET = process.env.JWT_SECRET || "utn-api-secret-key";
+const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || "7d";
 
 /**
- * Middleware: revisa si viene token y si existe en la BD.
- * Si existe, deja pasar y pega el usuario en req.user
+ * Construye una versión segura del usuario para devolverla al cliente.
+ * Se excluyen campos sensibles o internos que no deberían exponerse.
+ */
+const buildAuthUser = (user) => ({
+  id: user._id,
+  name: user.name,
+  lastname: user.lastname,
+  email: user.email,
+});
+
+/**
+ * Genera el JWT que representará la sesión autenticada del usuario.
+ */
+const generateJwt = (user) =>
+  jwt.sign(
+    {
+      userId: user._id,
+      email: user.email,
+    },
+    JWT_SECRET,
+    { expiresIn: JWT_EXPIRES_IN }
+  );
+
+/**
+ * Middleware que valida el token recibido en Authorization: Bearer <token>
+ * y carga el usuario autenticado en req.user.
  */
 const authenticateToken = async (req, res, next) => {
-  const authHeader = req.headers["authorization"];
+  const authHeader = req.headers.authorization;
   const token = authHeader && authHeader.split(" ")[1];
 
   if (!token) {
@@ -14,22 +42,25 @@ const authenticateToken = async (req, res, next) => {
   }
 
   try {
-    const user = await User.findOne({ token });
+    const decoded = jwt.verify(token, JWT_SECRET);
 
+    const user = await User.findById(decoded.userId);
     if (!user) {
       return res.status(401).json({ message: "Invalid or expired token" });
     }
 
     req.user = user;
-    next();
+    return next();
   } catch (error) {
     console.error("Error authenticating token:", error);
-    return res.status(500).json({ message: "Error authenticating token" });
+    return res.status(401).json({ message: "Invalid or expired token" });
   }
 };
 
 /**
- * Login: valida email+password, genera token, lo guarda en BD y lo devuelve.
+ * Login.
+ * Valida las credenciales del usuario y, si son correctas, devuelve
+ * un JWT firmado para autenticación en rutas protegidas.
  */
 const generateToken = async (req, res) => {
   const { email, password } = req.body;
@@ -39,28 +70,24 @@ const generateToken = async (req, res) => {
   }
 
   try {
-    const user = await User.findOne({ email: email.toLowerCase().trim() });
+    const normalizedEmail = email.toLowerCase().trim();
+    const user = await User.findOne({ email: normalizedEmail });
 
     if (!user) {
       return res.status(401).json({ message: "Invalid email or password" });
     }
 
-    // Comparar contraseña con hash guardado
-    const ok = await bcrypt.compare(password, user.password);
-    if (!ok) {
+    const passwordMatches = await bcrypt.compare(password, user.password);
+    if (!passwordMatches) {
       return res.status(401).json({ message: "Invalid email or password" });
     }
 
-    // Token "simple": hash con algo que cambie (Date.now) para que no sea igual siempre
-    const token = await bcrypt.hash(email + password + Date.now(), 10);
+    const token = generateJwt(user);
 
-    user.token = token;
-    await user.save();
-
-    return res.status(201).json({
+    return res.status(200).json({
       message: "Login exitoso",
-      token: user.token,
-      user: { id: user._id, name: user.name, lastname: user.lastname, email: user.email },
+      token,
+      user: buildAuthUser(user),
     });
   } catch (error) {
     console.error("Error generating token:", error);
@@ -69,18 +96,12 @@ const generateToken = async (req, res) => {
 };
 
 /**
- * Logout: borra token en BD para que deje de servir.
- * Requiere que venga autenticado.
+ * Logout.
+ * Con JWT stateless no es necesario eliminar sesión en la base de datos.
+ * El cliente solo debe descartar el token almacenado localmente.
  */
-const logout = async (req, res) => {
-  try {
-    req.user.token = null;
-    await req.user.save();
-    return res.json({ message: "Logout exitoso" });
-  } catch (error) {
-    console.error("Error logout:", error);
-    return res.status(500).json({ message: "Error en logout" });
-  }
+const logout = async (_req, res) => {
+  return res.json({ message: "Logout exitoso" });
 };
 
 module.exports = { authenticateToken, generateToken, logout };

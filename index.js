@@ -7,6 +7,7 @@ const path = require("path");
 const userRoutes = require("./routes/userRoutes");
 const authRoutes = require("./routes/authRoutes");
 const vehicleRoutes = require("./routes/vehicleRoutes");
+const messageRoutes = require("./routes/messageRoutes");
 
 const app = express();
 app.use(cors());
@@ -16,6 +17,7 @@ app.use("/uploads", express.static(path.join(__dirname, "uploads")));
 app.use("/api/users", userRoutes);
 app.use("/api/auth", authRoutes);
 app.use("/api/vehicles", vehicleRoutes);
+app.use("/api/questions", messageRoutes);
 
 const PORT = process.env.PORT || 3000;
 
